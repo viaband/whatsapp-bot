@@ -1,94 +1,196 @@
-import express from "express";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
-import getRawBody from "raw-body";
-import crypto from "crypto";
+// server.js
+// WhatsApp Cloud API bot + OCR (OCR.Space) + forward para Google Sheets (Apps Script WebApp)
 
-dotenv.config();
+const express = require("express");
+const crypto = require("crypto");
+const axios = require("axios");
+
 const app = express();
-const { PORT=3000, VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID, APP_SECRET } = process.env;
+app.use(express.json({ limit: "10mb" }));
 
-// captura raw body para verificar assinatura
-app.use(async (req, res, next) => {
-  if (req.method === "POST") {
-    req.rawBody = await getRawBody(req);
-    try { req.body = JSON.parse(req.rawBody.toString("utf8") || "{}"); } catch { req.body = {}; }
-  }
-  next();
-});
+// ---------- ENV ----------
+const PORT = process.env.PORT || 3000;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;              // ex: Pat2F9cr01
+const APP_SECRET = process.env.APP_SECRET || "";            // opcional (verificação de assinatura)
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;        // ex: 816790541507574
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;          // EAAP...
+const OCRSPACE_API_KEY = process.env.OCRSPACE_API_KEY;      // sua chave OCR.Space
+const OCR_FORWARD_URL = process.env.OCR_FORWARD_URL || "";  // URL do WebApp do Apps Script (opcional)
 
-// rota de saúde
-app.get("/", (_, res) => res.status(200).send("OK"));
+// ---------- Helpers ----------
+const WA_BASE = "https://graph.facebook.com/v21.0";
 
-// verificação do webhook (GET)
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
-});
+async function sendText(to, body) {
+  return axios.post(
+    `${WA_BASE}/${PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body },
+    },
+    { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
+  );
+}
 
-// verifica a assinatura do Meta
-function verifySignature(req) {
-  if (!APP_SECRET) return true; // se não setar, não verifica
-  const sig = req.header("x-hub-signature-256") || "";
-  const hmac = crypto.createHmac("sha256", APP_SECRET);
-  const digest = "sha256=" + hmac.update(req.rawBody).digest("hex");
+// pega URL assinada de uma mídia do WhatsApp
+async function getMediaUrl(mediaId) {
+  const r = await axios.get(`${WA_BASE}/${mediaId}`, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    params: { fields: "url,mime_type,sha256,file_size" },
+  });
+  return r.data?.url;
+}
+
+// OCR via OCR.Space (usando URL pública da imagem do WhatsApp)
+async function runOCRSpace(imageUrl) {
   try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig));
-  } catch {
-    return false;
+    const form = new URLSearchParams();
+    form.append("url", imageUrl);
+    form.append("language", "por");             // português (pode usar "por+eng")
+    form.append("isOverlayRequired", "false");
+
+    const resp = await axios.post("https://api.ocr.space/parse/image", form, {
+      headers: {
+        apikey: OCRSPACE_API_KEY,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      timeout: 30000,
+    });
+
+    const parsed = resp.data?.ParsedResults?.[0]?.ParsedText || "";
+    return parsed.trim();
+  } catch (err) {
+    console.error("OCR.Space error:", err?.response?.data || err.message);
+    return "";
   }
 }
 
-// recebe eventos (POST)
-app.post("/webhook", async (req, res) => {
+// encaminha resultado para seu Apps Script (Google Sheets)
+async function forwardToSheet(payload) {
+  if (!OCR_FORWARD_URL) return;
   try {
-    if (!verifySignature(req)) return res.sendStatus(401);
+    await axios.post(OCR_FORWARD_URL, payload, { timeout: 15000 });
+  } catch (err) {
+    console.error("Erro ao salvar no Google Sheets:", err?.response?.data || err.message);
+  }
+}
 
-    const entry = req.body?.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-    const messages = value?.messages;
+// ---------- Routes ----------
+app.get("/", (_req, res) => res.send("OK"));
 
-    if (messages && messages.length > 0) {
-      const msg = messages[0];
-      const from = msg.from;
-      const text = msg.text?.body || "";
-      const name = value?.contacts?.[0]?.profile?.name || "aí";
+// verificação do webhook (Meta → GET)
+app.get("/webhook", (req, res) => {
+  try {
+    const mode = req.query["hub.mode"];
+    const token = req.query["hub.verify_token"];
+    const challenge = req.query["hub.challenge"];
 
-      // marca como lida
-      await fetch(`https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`, {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ messaging_product: "whatsapp", status: "read", message_id: msg.id })
-      });
-
-      // responde
-      const reply = text
-        ? `Olá, ${name}! 👋 Recebi sua mensagem: “${text}”. Já retorno.`
-        : `Olá, ${name}! 👋 Recebi sua mensagem. Já retorno.`;
-
-      await fetch(`https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}/messages`, {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          to: from,
-          type: "text",
-          text: { body: reply }
-        })
-      });
+    if (mode === "subscribe" && token === VERIFY_TOKEN) {
+      return res.status(200).send(challenge);
     }
-
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error("Erro no webhook:", e);
-    return res.sendStatus(500);
+    return res.sendStatus(403);
+  } catch {
+    return res.sendStatus(403);
   }
 });
 
-app.listen(PORT, () => console.log(`Webhook on ${PORT}`));
+// recepção de eventos (Meta → POST)
+app.post("/webhook", async (req, res) => {
+  try {
+    const entry = req.body?.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
+    const msg = value?.messages?.[0];
+
+    if (!msg) return res.sendStatus(200);
+
+    const from = msg.from; // telefone do usuário (E.164)
+    const name = value?.contacts?.[0]?.profile?.name || "";
+    const type = msg.type;
+
+    // ---- Texto ----
+    if (type === "text" && msg.text?.body) {
+      const body = msg.text.body.trim();
+
+      // exemplo simples de resposta:
+      if (body === "/menu") {
+        await sendText(
+          from,
+          "📋 *Menu*\n\n• Envie um *print* (imagem) que eu extraio o texto.\n• Envie */menu* para ver opções."
+        );
+      } else {
+        await sendText(from, `Você disse: ${body}`);
+      }
+      return res.sendStatus(200);
+    }
+
+    // ---- Imagem (print) ----
+    if (type === "image" && msg.image?.id) {
+      try {
+        // 1) URL pública da imagem
+        const mediaUrl = await getMediaUrl(msg.image.id);
+
+        // 2) OCR
+        const text = await runOCRSpace(mediaUrl);
+
+        // 3) Resposta no WhatsApp
+        const reply = text
+          ? `🧾 *Texto reconhecido:*\n\n${text.slice(0, 3000)}`
+          : "Não consegui identificar texto na imagem. Pode enviar um print mais nítido?";
+        await sendText(from, reply);
+
+        // 4) Encaminhar para a planilha (Apps Script WebApp)
+        await forwardToSheet({
+          from,
+          name,
+          text,
+          mediaUrl,
+          mediaId: msg.image.id,
+          ts: Date.now(),
+        });
+      } catch (e) {
+        console.error("Erro no fluxo de imagem/OCR:", e?.response?.data || e.message);
+        await sendText(
+          from,
+          "Tentei ler o texto do seu print, mas algo deu errado. Pode reenviar a imagem?"
+        );
+      }
+      return res.sendStatus(200);
+    }
+
+    // ---- Documento do tipo imagem (opcional) ----
+    if (type === "document" && msg.document?.id && msg.document?.mime_type?.startsWith("image/")) {
+      try {
+        const mediaUrl = await getMediaUrl(msg.document.id);
+        const text = await runOCRSpace(mediaUrl);
+
+        const reply = text
+          ? `🧾 *Texto reconhecido:*\n\n${text.slice(0, 3000)}`
+          : "Não consegui identificar texto no arquivo de imagem. Pode enviar um print mais nítido?";
+        await sendText(from, reply);
+
+        await forwardToSheet({
+          from,
+          name,
+          text,
+          mediaUrl,
+          mediaId: msg.document.id,
+          ts: Date.now(),
+        });
+      } catch (e) {
+        console.error("Erro no OCR de documento:", e?.response?.data || e.message);
+      }
+      return res.sendStatus(200);
+    }
+
+    // outros tipos (áudio, sticker, etc.) – resposta padrão
+    await sendText(from, "Recebi sua mensagem! Envie um *print (imagem)* para extrair o texto.");
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error("Erro no webhook:", err?.response?.data || err.message);
+    return res.sendStatus(200);
+  }
+});
+
+app.listen(PORT, () => console.log(`Webhook on port ${PORT}`));
